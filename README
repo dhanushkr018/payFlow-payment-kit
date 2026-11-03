@@ -1,0 +1,205 @@
+# PayFlow
+
+PayFlow is an Android demo of a UPI-style wallet. A valid Indian mobile number signs you in with the PayFlow server. No SMS is sent, and nothing is sent to a bank.
+
+The server settles payments. The phone keeps an encrypted session and a Room copy of the wallet so history is still available offline.
+
+## Phase 1
+
+- Kotlin and Jetpack Compose, with Material 3
+- PayFlow color palette and Outfit typography, applied through `PayFlowTheme`
+- Welcome, demo login, Home, Send money, History, and Profile
+- Navigation Compose, with a bottom bar on the signed-in screens
+- MVVM: each screen that holds state has a `ViewModel`, and demo auth lives in `DemoAuthRepository`
+
+## Phase 2
+
+Simulated payments on top of the Phase 1 shell:
+
+- Home shows a greeting, avatar, demo balance, shortcuts, and recent transactions
+- Send money validates a UPI ID, an amount, and optional remarks
+- Confirmation is required before a local payment service runs
+- The service can succeed, fail (`@fail`), or stay pending (`@hold`), and it refuses an overdraft or a repeated submission
+- History lists credits and debits, with search, status filters, and a detail screen
+
+Try `anita.sharma@okaxis` for a successful payment. The opening demo balance is ₹24,580.00.
+
+## Phase 3
+
+The wallet and the transaction ledger are stored in Room (`payflow.db`). History and the balance are `StateFlow`s, so a new payment shows up without a manual refresh.
+
+- A successful payment reduces the saved balance once
+- A failed or pending payment is stored and does not reduce the balance
+- The same transaction id or idempotency key cannot be inserted twice
+- Opening the app again loads the saved balance, history, and any pending rows
+- Pending rows are not submitted again on startup
+
+In this phase, sign-in stayed in memory. Phase 5 restores the session from the device.
+
+## Phase 4
+
+`backend/` is a Spring Boot API for the same simulated wallet. Phase 5 connects the Android app to it.
+
+- Java 17, Spring Boot 3.5, Spring Web, Spring Data JPA, H2, Jakarta Bean Validation, Maven, JUnit 5, and Mockito
+- Controllers call services. Services call repositories. Repositories talk to H2
+- A user has a name and a phone number. Each user has one wallet, stored in paise, with a version column for optimistic locking
+- A payment row stores the transaction id, idempotency key, sender, receiver UPI ID and name, amount in paise, remarks, status, type, and timestamp
+- `POST /api/auth/login` accepts an Indian mobile number and returns a demo bearer token. A new phone receives the opening balance of ₹24,580.00 (2,458,000 paise) and the same five seed transactions as the app
+- `GET /api/account/balance` returns that wallet
+- `POST /api/payments` settles a debit. `GET /api/payments/{transactionId}` and `GET /api/transactions` read the signed-in user's history
+
+Payment rules match the app:
+
+- `anita.sharma@okaxis` succeeds, and so does every other valid UPI ID whose handle is not `fail` or `hold`
+- A handle of `fail` is stored as `FAILED` and does not change the balance
+- A handle of `hold` is stored as `PENDING` and does not change the balance
+- A success that is larger than the balance returns `422` and writes nothing
+- Repeating the same idempotency key and payload returns the original payment and does not debit again
+- The same key with a different amount, UPI ID, remarks, or user returns `409`
+
+Other responses: `201` for a new payment, `200` for an idempotent replay, `400` for a bad phone number or UPI ID, `401` when the bearer token is missing, `404` when the transaction belongs to someone else or does not exist.
+
+### Run the API
+
+From `backend/`, with JDK 17 or newer and Maven:
+
+```bash
+mvn test
+mvn spring-boot:run
+```
+
+The API listens on port 8080. The H2 console is at `http://localhost:8080/h2-console`. Use JDBC URL `jdbc:h2:file:./data/payflow`, user `sa`, and an empty password. The file database is created under `backend/data/` and is gitignored.
+
+```bash
+curl -s -X POST http://localhost:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"phoneNumber":"9876543210"}'
+```
+
+Send the returned token on later calls as `Authorization: Bearer <token>`.
+
+```bash
+curl -s http://localhost:8080/api/account/balance \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -s -X POST http://localhost:8080/api/payments \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotencyKey":"demo-1","receiverUpiId":"anita.sharma@okaxis","amountPaise":250000,"remarks":"Rent"}'
+```
+
+`shop.keeper@fail` is declined. `later.please@hold` stays pending. Sending `demo-1` again returns the first payment.
+
+## Phase 5
+
+The Android app sends sign-in, balance, payments, and history to the API. The server is the only place a payment changes the wallet. Room keeps a copy so History still opens offline.
+
+- Retrofit and OkHttp call `http://10.0.2.2:8080/` from an emulator. That address is the development host, set in `BuildConfig.API_BASE_URL`. Debug builds allow cleartext only for `10.0.2.2`, `localhost`, and `127.0.0.1`.
+- `POST /api/auth/login` returns a bearer token. The token is encrypted with an Android Keystore AES-GCM key, and DataStore stores the ciphertext. Login requests do not send the `Authorization` header. Debug logs record the path and status code, not the token.
+- Opening the app restores that session. HTTP 401 clears it. A timeout or a refused connection does not.
+- Home shows the balance from `GET /api/account/balance`. After a payment, the balance on screen is the balance in the server response. The phone does not subtract the amount itself.
+- Confirming a payment saves the attempt, including its idempotency key, before the request is sent. A retry uses that same key and payload. A timeout is not treated as a failure. If the server already returned a transaction id, PayFlow loads `GET /api/payments/{transactionId}` and does not submit the payment again.
+- History reads `GET /api/transactions` when the server answers, and shows the Room cache when it does not.
+
+### Run the app against the API
+
+Start the API first, from `backend/`:
+
+```bash
+mvn spring-boot:run
+```
+
+Then run the Android app on an emulator. `10.0.2.2` reaches the API on the computer that is hosting the emulator. Sign in with `9876543210`. Home should show the server balance, and History should list the five seed transactions.
+
+```bash
+./gradlew :app:assembleDebug :app:testDebugUnitTest
+```
+
+### Check that a restart keeps the session
+
+1. Start the API and run the app on an emulator.
+2. Sign in with `9876543210`.
+3. Send a small successful payment to `anita.sharma@okaxis`, and optionally one to `later.please@hold`.
+4. Note the balance and the new rows in History.
+5. Force-stop PayFlow. Do not clear storage, and leave the API running.
+6. Open PayFlow again. The session comes back without signing in. Home shows the server balance. History still lists the payment, and the `@hold` payment is still pending. PayFlow does not submit it again.
+
+## Requirements
+
+- JDK 17 or newer (JDK 21 is fine)
+- Android SDK Platform 37.1
+- Android SDK Build-Tools 36.0.0
+- Android SDK Platform-Tools
+
+The app compiles against SDK 37.1 because the current Compose libraries require it. `targetSdk` is 36, and `minSdk` is 26.
+
+## Build from a terminal
+
+From the project root, point Gradle at your SDK if `local.properties` is not already present:
+
+```bash
+echo "sdk.dir=$HOME/Android/Sdk" > local.properties
+```
+
+On macOS the default SDK path is `$HOME/Library/Android/sdk`.
+
+```bash
+./gradlew :app:assembleDebug :app:testDebugUnitTest
+```
+
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
+
+## Run on an Android emulator
+
+1. Install [Android Studio](https://developer.android.com/studio). Use a release that supports Android Gradle Plugin 9.5.
+2. Open **SDK Manager** and install:
+   - Android SDK Platform 37.1
+   - Android SDK Build-Tools 36.0.0
+   - Android SDK Platform-Tools
+   - Android Emulator
+   - A system image: **API 36**, **Google APIs**, **x86_64** (or arm64-v8a on Apple silicon)
+3. Open **Device Manager**, choose **Create Virtual Device**, pick **Pixel 7**, select the API 36 system image, and finish.
+4. Start that virtual device.
+5. Open this project in Android Studio. Studio writes `local.properties` with your `sdk.dir`.
+6. Select the `app` run configuration and press **Run**.
+
+From a terminal, with the emulator already running and `adb` on your `PATH`:
+
+```bash
+echo "sdk.dir=$HOME/Android/Sdk" > local.properties
+./gradlew :app:installDebug
+adb shell am start -n com.payflow/.MainActivity
+```
+
+## Demo sign-in
+
+1. On the welcome screen, tap **Continue**.
+2. Enter a 10-digit mobile number that starts with 6, 7, 8, or 9. `9876543210` is a valid example. A pasted `+91` prefix is accepted.
+3. Tap **Continue**. PayFlow opens Home.
+4. Use the bottom bar for Home, Send, History, and Profile. Scan QR is a placeholder.
+5. On Send, enter a UPI ID and an amount, continue, then confirm. The result screen shows the transaction ID and status from the server.
+6. On Profile, tap **Sign out** to return to the welcome screen. The next launch asks you to sign in again.
+
+## Project layout
+
+```
+backend/                         Spring Boot API (Maven)
+app/src/main/java/com/payflow/core/network   Retrofit client, auth header, API models
+app/src/main/java/com/payflow
+  MainActivity.kt              entry point
+  di/AppContainer.kt           Hilt composition root
+  di/DatabaseModule.kt         Room database, DAO, and application scope
+  di/NetworkModule.kt          Retrofit, OkHttp, and the development base URL
+  di/PaymentModule.kt          server-backed repository and drafts
+  data/auth                    encrypted session in DataStore
+  data/local                   Room cache of the wallet and history
+  data/payment                 server payments, with the old simulator kept for tests
+  domain/auth                  phone number rules
+  domain/payment               UPI ID, amount, and money formatting
+  ui/theme                     palette, type, shapes, PayFlowTheme
+  ui/navigation                routes, bottom bar, NavHost
+  ui/components                shared controls
+  ui/welcome|login|home|send|payment|history|scan|profile
+```
+
+Outfit is bundled under the SIL Open Font License. The license text is in `third_party/outfit/OFL.txt`.
